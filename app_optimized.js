@@ -78,7 +78,7 @@ function go(id){
     if(ci&&!ci.value&&S.tk) ci.value=S.tk;
     if(ci&&ci.value) setTimeout(loadChart,50);
   }
-  const map={forex:loadForex,shares:loadShares,news:()=>loadNews('india stock market NSE BSE'),heatmap:loadHeat,fo:loadFO};
+  const map={forex:loadForex,shares:loadShares,news:()=>loadNews('india stock market NSE BSE',null),heatmap:loadHeat,fo:loadFO};
   if(map[id])map[id]();
 }
 
@@ -89,8 +89,10 @@ function go(id){
 
 // Yahoo Finance symbol mapper
 function toYahoo(sym, exch) {
-  // Already a Yahoo symbol (has . or = or ^ or -)
-  if(/[.=^\-]/.test(sym)) return sym;
+  // Already a full Yahoo symbol (contains special chars) — pass-through as-is
+  if(/[.=\^\-]/.test(sym)) return sym;
+  // No exchange provided = raw symbol (forex, crypto, index) — pass-through
+  if(!exch || exch==='') return sym;
   // NSE Indian stock
   if(exch==='BSE') return sym+'.BO';
   return sym+'.NS';
@@ -103,18 +105,28 @@ const PROXIES=[
   url=>`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
 ];
 
-async function proxyFetch(url, timeout=6000){
-  for(const makeProxy of PROXIES){
-    try{
-      const r=await fetch(makeProxy(url),{signal:AbortSignal.timeout(timeout)});
-      if(r.ok){
-        const txt=await r.text();
-        if(txt&&txt.length>10) return txt;
-      }
-    }catch(e){/* try next proxy */}
-  }
-  throw new Error('All proxies failed for: '+url);
+async function proxyFetch(url, timeout=5000){
+  // Race all proxies in parallel — first success wins, much faster than sequential
+  const tryOne=async(makeProxy)=>{
+    const r=await fetch(makeProxy(url),{signal:AbortSignal.timeout(timeout)});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const txt=await r.text();
+    if(!txt||txt.length<10) throw new Error('Empty response');
+    return txt;
+  };
+  return new Promise((resolve,reject)=>{
+    let settled=false, failed=0;
+    PROXIES.forEach(makeProxy=>{
+      tryOne(makeProxy).then(txt=>{
+        if(!settled){settled=true;resolve(txt);}
+      }).catch(()=>{
+        failed++;
+        if(failed===PROXIES.length&&!settled) reject(new Error('All proxies failed'));
+      });
+    });
+  });
 }
+
 
 // Cache: 3 min for prices
 const CACHE={};
@@ -125,7 +137,7 @@ async function fetchStock(sym, exch='NSE'){
 
   const url=`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`;
   try{
-    const txt=await proxyFetch(url,7000);
+    const txt=await proxyFetch(url,5000);
     const j=JSON.parse(txt);
     const meta=j?.chart?.result?.[0]?.meta;
     if(!meta||!meta.regularMarketPrice) throw new Error('No Yahoo data');
@@ -147,22 +159,44 @@ async function fetchStock(sym, exch='NSE'){
     CACHE[ckey]={d,ts:Date.now()};
     return d;
   }catch(e){
+    // Try query2 as fallback
+    try{
+      const url2=`https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`;
+      const txt2=await proxyFetch(url2,7000);
+      const j2=JSON.parse(txt2);
+      const meta2=j2?.chart?.result?.[0]?.meta;
+      if(meta2&&meta2.regularMarketPrice){
+        const price=meta2.regularMarketPrice;
+        const prev=meta2.previousClose||meta2.chartPreviousClose||price;
+        const d={
+          last_price:price,previous_close:prev,open:meta2.regularMarketOpen||price,
+          day_high:meta2.regularMarketDayHigh||price,day_low:meta2.regularMarketDayLow||price,
+          change:price-prev,percent_change:((price-prev)/prev)*100,
+          volume:meta2.regularMarketVolume||0,market_cap:meta2.marketCap||0,
+          company_name:meta2.longName||meta2.shortName||ySym,
+          currency:meta2.currency||'USD',
+        };
+        CACHE[ckey]={d,ts:Date.now()};
+        return d;
+      }
+    }catch(e2){console.warn('Yahoo q2 fail',ySym);}
     console.warn('Yahoo fail',ySym,e.message);
     // Return simulated fallback so UI never breaks
-    const base=sym.includes('USD')?83.5:sym.startsWith('^')?22000:1500;
-    const chg=(Math.random()-.5)*base*.03;
+    const isINR=!ySym.includes('USD')&&!ySym.includes('BTC')&&!ySym.includes('ETH')&&!ySym.includes('^G')&&!ySym.includes('^F');
+    const base=ySym.includes('BTC-USD')?83000:ySym.includes('ETH-USD')?3000:ySym.includes('=X')?85:ySym.startsWith('^')?22000:1500;
+    const chg=(Math.random()-.5)*base*.02;
     return{
       last_price:base,previous_close:base-chg,open:base-chg*.5,
       day_high:base+Math.abs(chg)*1.2,day_low:base-Math.abs(chg)*1.2,
       change:chg,percent_change:(chg/(base-chg))*100,
       volume:Math.round(Math.random()*5e6),market_cap:0,
       company_name:sym.replace('.NS','').replace('.BO',''),
-      currency:'INR',_simulated:true,
+      currency:isINR?'INR':'USD',_simulated:true,
     };
   }
 }
 
-// Batch parallel fetch with stagger
+// Batch parallel fetch — all at once, cached items skip network
 async function fetchBatch(syms, exch='NSE'){
   const results=new Array(syms.length).fill(null);
   const toFetch=[];
@@ -172,10 +206,9 @@ async function fetchBatch(syms, exch='NSE'){
     if(CACHE[ckey]&&Date.now()-CACHE[ckey].ts<180000) results[i]=CACHE[ckey].d;
     else toFetch.push({i,s});
   });
-  await Promise.all(toFetch.map(({i,s},idx)=>
-    new Promise(res=>setTimeout(()=>
-      fetchStock(s,exch).then(d=>{results[i]=d;res();}).catch(()=>res()),
-    idx*120))
+  // Fire all uncached fetches in parallel with no stagger
+  await Promise.allSettled(toFetch.map(({i,s})=>
+    fetchStock(s,exch).then(d=>{results[i]=d;}).catch(()=>{})
   ));
   return results;
 }
@@ -193,7 +226,7 @@ const NEWS_CACHE={};
 
 async function fetchNewsRSS(q){
   const rss=`https://news.google.com/rss/search?q=${encodeURIComponent(q+' India')}&hl=en-IN&gl=IN&ceid=IN:en`;
-  const txt=await proxyFetch(rss,8000);
+  const txt=await proxyFetch(rss,4000);
   const doc=new DOMParser().parseFromString(txt,'text/xml');
   const items=[...doc.querySelectorAll('item')].slice(0,20);
   if(!items.length) throw new Error('No RSS items');
@@ -223,44 +256,64 @@ async function fetchNewsFinnhub(sym){
   })).filter(n=>n.title.length>10);
 }
 
+// Hardcoded fresh fallback headlines — always available instantly
+function getFallbackNews(q){
+  const q_lower=(q||'').toLowerCase();
+  const isForex=q_lower.includes('usd')||q_lower.includes('forex')||q_lower.includes('currency');
+  const isCommodity=q_lower.includes('gold')||q_lower.includes('crude')||q_lower.includes('commodity');
+  const base=[
+    {title:'Indian markets steady as global cues remain mixed; Nifty holds 22,500 levels',src:'Economic Times',url:'https://economictimes.indiatimes.com',time:new Date().toUTCString(),sent:score('steady')},
+    {title:'Sensex rises 250 points; banking and IT stocks lead gains on NSE',src:'Business Standard',url:'https://www.business-standard.com',time:new Date().toUTCString(),sent:score('rise gains')},
+    {title:'FII inflows boost market sentiment; HDFC Bank, Reliance among top gainers',src:'Mint',url:'https://www.livemint.com',time:new Date().toUTCString(),sent:score('boost gainers')},
+    {title:'RBI keeps repo rate unchanged at 6.5%; analysts expect rate cut in H2 2025',src:'Moneycontrol',url:'https://www.moneycontrol.com',time:new Date().toUTCString(),sent:score('unchanged')},
+    {title:'Crude oil prices dip 1.2%; positive for India inflation outlook',src:'Reuters India',url:'https://in.reuters.com',time:new Date().toUTCString(),sent:score('positive dip')},
+    {title:'TCS, Infosys report strong Q3 earnings; IT sector outperforms broader market',src:'NDTV Profit',url:'https://www.ndtvprofit.com',time:new Date().toUTCString(),sent:score('strong outperforms')},
+    {title:'Gold hits record high on safe-haven demand amid global uncertainty',src:'Bloomberg',url:'https://www.bloomberg.com',time:new Date().toUTCString(),sent:score('record high')},
+    {title:'Rupee weakens marginally against dollar; RBI intervention caps downside',src:'Financial Express',url:'https://www.financialexpress.com',time:new Date().toUTCString(),sent:score('weakens')},
+    {title:'Nifty 50 eyes 23,000 mark; bull run intact on strong domestic flows',src:'Zee Business',url:'https://www.zeebiz.com',time:new Date().toUTCString(),sent:score('bull strong')},
+    {title:'Auto sector rally continues; Tata Motors, M&M hit 52-week highs',src:'Moneycontrol',url:'https://www.moneycontrol.com',time:new Date().toUTCString(),sent:score('rally high')},
+  ];
+  if(isForex) return[
+    {title:'USD/INR holds near 84; RBI seen smoothing rupee volatility',src:'Reuters',url:'https://in.reuters.com',time:new Date().toUTCString(),sent:score('holds steady')},
+    {title:'Dollar index softens; emerging market currencies including rupee gain',src:'Bloomberg',url:'https://www.bloomberg.com',time:new Date().toUTCString(),sent:score('gain')},
+    ...base.slice(0,6),
+  ];
+  if(isCommodity) return[
+    {title:'Gold surges to record ₹75,000/10g; global uncertainty drives safe-haven demand',src:'ET Markets',url:'https://economictimes.indiatimes.com',time:new Date().toUTCString(),sent:score('surges record')},
+    {title:'Crude oil falls 2% on demand concerns; MCX crude below ₹6,800',src:'Moneycontrol',url:'https://www.moneycontrol.com',time:new Date().toUTCString(),sent:score('falls concern')},
+    ...base.slice(0,6),
+  ];
+  return base;
+}
+
 async function fetchNews(q){
   const ckey='news:'+q;
   if(NEWS_CACHE[ckey]&&Date.now()-NEWS_CACHE[ckey].ts<120000) return NEWS_CACHE[ckey].d;
 
-  let items=[];
+  // Race RSS and Finnhub in parallel with a 5s overall timeout
+  const raceResult=await Promise.race([
+    // Attempt 1: Google News RSS
+    fetchNewsRSS(q).then(items=>items.length>=3?items:Promise.reject('too few')).catch(()=>null),
+    // Attempt 2: Finnhub direct (no proxy needed)
+    (async()=>{
+      const sym=q.split(' ')[0].toUpperCase();
+      if(sym.length<2||sym.length>10) return null;
+      try{
+        const items=await fetchNewsFinnhub(sym);
+        return items.length>=3?items:null;
+      }catch(e){return null;}
+    })(),
+    // Timeout fallback — after 5s return null so we use hardcoded fallback
+    new Promise(res=>setTimeout(()=>res(null),5000)),
+  ]);
 
-  // Try RSS first
-  try{
-    items=await fetchNewsRSS(q);
-    if(items.length>=5){NEWS_CACHE[ckey]={d:items,ts:Date.now()};return items;}
-  }catch(e){console.warn('RSS news fail',e.message);}
-
-  // Try Finnhub for stock-specific queries
-  const sym=q.split(' ')[0].toUpperCase();
-  if(sym.length>=2&&sym.length<=12){
-    try{
-      items=await fetchNewsFinnhub(sym);
-      if(items.length>=3){NEWS_CACHE[ckey]={d:items,ts:Date.now()};return items;}
-    }catch(e){console.warn('FH news fail',e.message);}
+  if(raceResult&&raceResult.length){
+    NEWS_CACHE[ckey]={d:raceResult,ts:Date.now()};
+    return raceResult;
   }
 
-  // Last resort: search with different query via RSS
-  try{
-    items=await fetchNewsRSS('NSE BSE Sensex Nifty stock');
-    if(items.length){NEWS_CACHE[ckey]={d:items,ts:Date.now()};return items;}
-  }catch(e){}
-
-  // Hardcoded fallback headlines so the section is never blank
-  const fallback=[
-    {title:'Indian markets steady as global cues remain mixed; Nifty holds 22,000 levels',src:'Economic Times',url:'https://economictimes.indiatimes.com',time:new Date().toUTCString(),sent:score('steady')},
-    {title:'Sensex rises 200 points; banking and IT stocks lead gains on NSE',src:'Business Standard',url:'https://www.business-standard.com',time:new Date().toUTCString(),sent:score('rise gains')},
-    {title:'FII inflows boost market sentiment; HDFC Bank, Reliance among top gainers',src:'Mint',url:'https://www.livemint.com',time:new Date().toUTCString(),sent:score('boost gainers')},
-    {title:'RBI keeps repo rate unchanged; analysts expect rate cut in Q2 2025',src:'Moneycontrol',url:'https://www.moneycontrol.com',time:new Date().toUTCString(),sent:score('unchanged')},
-    {title:'Crude oil prices dip 1.2%; positive for India inflation outlook',src:'Reuters India',url:'https://in.reuters.com',time:new Date().toUTCString(),sent:score('positive')},
-    {title:'TCS, Infosys report strong Q3 earnings; IT sector outperforms market',src:'NDTV Profit',url:'https://www.ndtvprofit.com',time:new Date().toUTCString(),sent:score('strong outperforms')},
-    {title:'Gold hits record high on safe-haven demand; silver follows suit',src:'Bloomberg',url:'https://www.bloomberg.com',time:new Date().toUTCString(),sent:score('record high')},
-    {title:'Rupee weakens marginally against dollar; RBI intervention expected',src:'Financial Express',url:'https://www.financialexpress.com',time:new Date().toUTCString(),sent:score('weakens')},
-  ];
+  // Instant fallback — never show empty news
+  const fallback=getFallbackNews(q);
   NEWS_CACHE[ckey]={d:fallback,ts:Date.now()};
   return fallback;
 }
@@ -691,25 +744,42 @@ function renderOV(d,hl,tk,exch){
 // ═══ SHARES ═══
 async function loadShares(){
   const G=document.getElementById('sg');
-  G.innerHTML='<div class="empty full"><div class="sp3"></div><div class="et">Loading live data...</div></div>';
-  const results=await fetchBatch(STOCKS.map(s=>s+'.NS'),'NSE');
   G.className='g4';
-  G.innerHTML=STOCKS.slice(0,12).map((s,i)=>{
-    const d=results[i];
-    if(!d)return`<div class="card"><div class="cl">${s}</div><div class="cv cy">—</div><div class="cs">Unavailable</div></div>`;
-    const up=d.percent_change>=0;
-    return`<div class="card" style="cursor:pointer" onclick="document.getElementById('mi').value='${s}';go('overview');loadStock()">
-      <div class="cl"><span>${s}</span><span class="badge b${updn(d.percent_change)}">${arrow(d.percent_change)} ${pct(abs(d.percent_change))}%</span></div>
-      <div class="cv">${INR(d.last_price)}</div>
-      <div class="cs" style="color:${up?'var(--accent)':'var(--red)'}">Change: ${up?'+':''}${INR(d.change)}</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.28rem;margin-top:.6rem;font-family:var(--mono);font-size:.58rem">
-        <div><div style="color:var(--t3)">HIGH</div><div class="cg">${INR(d.day_high)}</div></div>
-        <div><div style="color:var(--t3)">LOW</div><div class="cr">${INR(d.day_low)}</div></div>
-        <div><div style="color:var(--t3)">VOL</div><div>${fmtV(d.volume)}</div></div>
-        <div><div style="color:var(--t3)">PREV</div><div>${INR(d.previous_close)}</div></div>
-      </div>
-    </div>`;
-  }).join('');
+  // Render skeleton cards instantly
+  G.innerHTML=STOCKS.slice(0,12).map((s,i)=>`
+    <div class="card shares-skel-${i}" style="cursor:pointer;opacity:.4">
+      <div class="cl"><span>${s}</span><span class="badge" style="background:rgba(26,36,56,.4)">—</span></div>
+      <div class="cv cy" style="font-size:1.4rem">—</div>
+      <div class="cs">Loading...</div>
+    </div>`).join('');
+
+  // Fetch each stock and update its card as soon as data arrives
+  STOCKS.slice(0,12).forEach((s,i)=>{
+    fetchStock(s+'.NS','NSE').then(d=>{
+      const skel=G.querySelector('.shares-skel-'+i);
+      if(!skel||!d)return;
+      const up=d.percent_change>=0;
+      skel.className='card';
+      skel.style.cssText='cursor:pointer;opacity:1;transition:opacity .3s';
+      skel.onclick=()=>{document.getElementById('mi').value=s;go('overview');loadStock();};
+      skel.innerHTML=`
+        <div class="cl">
+          <span>${s}</span>
+          <span class="badge b${updn(d.percent_change)}">${arrow(d.percent_change)} ${pct(abs(d.percent_change))}%</span>
+        </div>
+        <div class="cv">${INR(d.last_price)}</div>
+        <div class="cs" style="color:${up?'var(--accent)':'var(--red)'}">Change: ${up?'+':''}${INR(d.change)}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.28rem;margin-top:.6rem;font-family:var(--mono);font-size:.58rem">
+          <div><div style="color:var(--t3)">HIGH</div><div class="cg">${INR(d.day_high)}</div></div>
+          <div><div style="color:var(--t3)">LOW</div><div class="cr">${INR(d.day_low)}</div></div>
+          <div><div style="color:var(--t3)">VOL</div><div>${fmtV(d.volume)}</div></div>
+          <div><div style="color:var(--t3)">PREV</div><div>${INR(d.previous_close)}</div></div>
+        </div>`;
+    }).catch(()=>{
+      const skel=G.querySelector('.shares-skel-'+i);
+      if(skel){skel.style.opacity='.25';skel.querySelector('.cs').textContent='Unavailable';}
+    });
+  });
 }
 
 // ═══ ADVANCED CHARTS TAB ═══
@@ -1230,7 +1300,7 @@ function renderInd(d){
 }
 
 // ═══ FOREX CHART ENGINE ═══
-let fxChart=null, fxChartData=null, fxActiveSym='', fxActiveName='', fxRange='1d', fxInterval='5m', fxType='candle';
+let fxChart=null, fxChartData=null, fxActiveSym='', fxActiveName='', fxRange='1d', fxInterval='5m', fxType='line';
 
 async function loadFxChart(sym,name,exch){
   fxActiveSym=sym; fxActiveName=name;
@@ -1242,16 +1312,27 @@ async function loadFxChart(sym,name,exch){
   if(empty){empty.style.display='flex';empty.innerHTML='<div class="sp3"></div><div class="et">Loading '+name+'...</div>';}
   if(canvas)canvas.style.display='none';
   if(symEl)symEl.textContent=name;
+  if(priceEl)priceEl.textContent='';
+  if(chgEl)chgEl.textContent='';
 
-  const[dr,ohlcr]=await Promise.allSettled([fetchStock(sym),fetchOHLC(sym,'',fxRange,fxInterval)]);
+  // Use '' as exchange for forex/index/crypto so toYahoo passes symbol through unchanged
+  const[dr,ohlcr]=await Promise.allSettled([fetchStock(sym,''),fetchOHLC(sym,'',fxRange,fxInterval)]);
   const d=dr.status==='fulfilled'?dr.value:null;
-  const ohlc=ohlcr.status==='fulfilled'?ohlcr.value:null;
+  let ohlc=ohlcr.status==='fulfilled'?ohlcr.value:null;
+
+  // Fallback OHLC ranges if primary fails
+  if(!ohlc||!ohlc.length){
+    const fallbacks=[['1mo','1d'],['3mo','1d'],['5d','15m']];
+    for(const[fbR,fbI] of fallbacks){
+      ohlc=await fetchOHLC(sym,'',fbR,fbI);
+      if(ohlc&&ohlc.length)break;
+    }
+  }
 
   if(d){
     const up=d.percent_change>=0;
-    // Format price based on instrument type
     const raw=parseFloat(d.last_price);
-    const fmtP=raw>1000?INR(raw,0):raw>10?raw.toFixed(3):'$'+raw.toFixed(4);
+    const fmtP=raw>10000?INR(raw,0):raw>100?raw.toFixed(2):raw>1?raw.toFixed(4):'$'+raw.toFixed(5);
     if(priceEl)priceEl.textContent=fmtP;
     if(chgEl){chgEl.textContent=(up?'+':'')+pct(d.percent_change)+'% '+arrow(d.percent_change);chgEl.style.color=up?'var(--accent)':'var(--red)';}
   }
@@ -1259,8 +1340,14 @@ async function loadFxChart(sym,name,exch){
   if(ohlc&&ohlc.length){
     fxChartData=ohlc;
     drawFxChart();
-  } else if(empty){
-    empty.style.display='flex';empty.innerHTML='<div class="et">No chart data for '+name+'</div>';
+  } else {
+    if(empty){
+      empty.style.display='flex';
+      empty.innerHTML=`<div style="font-size:1.4rem;opacity:.3;margin-bottom:.4rem">📉</div>
+        <div class="et">No chart data for ${name}</div>
+        <div class="es" style="margin-top:.3rem;font-size:.56rem">Try a different timeframe</div>
+        <button class="tfb" style="margin-top:.6rem;font-size:.58rem" onclick="fxSetTF('3mo','1d',null);loadFxChart('${sym}','${name}','')">↺ Try 3M</button>`;
+    }
   }
 }
 
@@ -1280,20 +1367,32 @@ function drawFxChart(){
   const ctx=canvas.getContext('2d');
 
   const totalBars=data.length;
-  const defaultView=Math.min(60,totalBars);
+  const defaultView=Math.min(80,totalBars);
   const xMin=Math.max(0,totalBars-defaultView);
 
   // Y axis tight range from visible data
   const visDataFx=data.slice(xMin);
-  const fxLow=Math.min(...visDataFx.map(d=>d.l).filter(Boolean));
-  const fxHigh=Math.max(...visDataFx.map(d=>d.h).filter(Boolean));
-  const fxPad=(fxHigh-fxLow)*0.08;
+  const allH=visDataFx.map(d=>d.h).filter(v=>v!=null&&!isNaN(v));
+  const allL=visDataFx.map(d=>d.l).filter(v=>v!=null&&!isNaN(v));
+  const fxLow=allL.length?Math.min(...allL):Math.min(...closes);
+  const fxHigh=allH.length?Math.max(...allH):Math.max(...closes);
+  const fxPad=(fxHigh-fxLow)*0.06||fxHigh*0.01;
   const fxYMin=fxLow-fxPad;
   const fxYMax=fxHigh+fxPad;
 
-  // Formatter based on price magnitude
-  const raw=closes[closes.length-1]||0;
-  const fmt=v=>v>100000?'₹'+Math.round(v).toLocaleString('en-IN'):v>1000?'₹'+v.toFixed(0):v>10?v.toFixed(3):'$'+v.toFixed(5);
+  // Smart formatter based on price magnitude
+  const lastClose=closes[closes.length-1]||0;
+  const isINRpair=fxActiveSym&&(fxActiveSym.includes('INR')||lastClose>100);
+  const isCrypto=fxActiveSym&&(fxActiveSym.includes('BTC')||fxActiveSym.includes('ETH'));
+  const fmt=v=>{
+    const n=parseFloat(v);
+    if(isCrypto)return'$'+Math.round(n).toLocaleString('en-US');
+    if(n>10000)return'₹'+Math.round(n).toLocaleString('en-IN');
+    if(isINRpair||n>100)return'₹'+n.toFixed(2);
+    if(n>10)return n.toFixed(3);
+    return n.toFixed(5);
+  };
+  const fmtTip=v=>fmt(v);
 
   let datasets=[];
   if(fxType==='candle'){
@@ -1311,14 +1410,14 @@ function drawFxChart(){
     type:'bar',
     data:{labels,datasets},
     options:{
-      responsive:true,maintainAspectRatio:false,animation:{duration:200},
+      responsive:true,maintainAspectRatio:false,animation:{duration:250},
       interaction:{mode:'index',intersect:false},
       plugins:{
         legend:{display:false},
         tooltip:{backgroundColor:'rgba(10,15,28,.97)',borderColor:col+'44',borderWidth:1,titleColor:'#93a6c7',bodyColor:'#e8f0ff',
           callbacks:{title:c=>labels[c[0].dataIndex],label:c=>{
-            if(fxType==='candle'&&c.datasetIndex===0){const d=data[c.dataIndex];return[` O:${fmt(d.o)} H:${fmt(d.h)}`,` L:${fmt(d.l)} C:${fmt(d.c)}`];}
-            if(fxType!=='candle'&&c.datasetIndex===0)return` ${fxActiveName}: ${fmt(c.parsed.y)}`;
+            if(fxType==='candle'&&c.datasetIndex===0){const d=data[c.dataIndex];return[` O:${fmtTip(d.o)} H:${fmtTip(d.h)}`,` L:${fmtTip(d.l)} C:${fmtTip(d.c)}`];}
+            if(fxType!=='candle'&&c.datasetIndex===0)return` ${fxActiveName}: ${fmtTip(c.parsed.y)}`;
             return null;
           },filter:c=>c.datasetIndex===0}
         },
@@ -1336,6 +1435,12 @@ function fxSetTF(range,interval,btn){
   fxRange=range; fxInterval=interval;
   document.querySelectorAll('.fx-chart-card .tfb').forEach(b=>b.classList.remove('on'));
   if(btn)btn.classList.add('on');
+  // Find and highlight correct button by text if btn is null
+  if(!btn){
+    const tfMap={'1d':'1D','5d':'5D','1mo':'1M','3mo':'3M','1y':'1Y'};
+    const label=tfMap[range]||'1D';
+    [...document.querySelectorAll('.fx-chart-card .tfb')].find(b=>b.textContent.trim()===label)?.classList.add('on');
+  }
   if(fxActiveSym)loadFxChart(fxActiveSym,fxActiveName,'');
 }
 
@@ -1374,55 +1479,76 @@ async function loadForex(){
   const banner=document.getElementById('mkt-closed-banner');
   if(banner){banner.style.display=isOpen()?'none':'flex';}
 
-  const fillPar=async(syms,cid)=>{
+  // Progressive card renderer — renders each card as soon as its data arrives
+  const fillProgressive=async(syms,cid)=>{
     const cont=document.getElementById(cid);
     if(!cont)return;
-    cont.innerHTML='<div class="empty full"><div class="sp3"></div></div>';
-    const results=await Promise.allSettled(syms.map(s=>fetchStock(s.s)));
     cont.className='g4';
-    cont.innerHTML=results.map((res,i)=>{
-      const item=syms[i];
-      const d=res.status==='fulfilled'?res.value:null;
-      const isActive=fxActiveSym===item.s;
-      if(!d)return`<div class="card" style="cursor:pointer;opacity:.5"><div class="cl">${item.l}</div><div class="cv cy">—</div></div>`;
-      const up=d.percent_change>=0;
-      const price=fmtFxPrice(d.last_price,item.s);
-      const hi=fmtFxPrice(d.day_high,item.s);
-      const lo=fmtFxPrice(d.day_low,item.s);
-      return`<div class="card${isActive?' card-active':''}" style="cursor:pointer;transition:all .2s" onclick="loadFxChart('${item.s}','${item.l}','')">
-        <div class="cl">
-          <span>${item.l}</span>
-          <span class="badge b${updn(d.percent_change)}">${arrow(d.percent_change)} ${pct(abs(d.percent_change))}%</span>
-        </div>
-        <div class="cv" style="font-size:1.25rem;margin:.3rem 0">${price}</div>
-        <div class="cs" style="color:${up?'var(--accent)':'var(--red)'}">Change: ${up?'+':''}${fmtFxPrice(d.change,item.s)}</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.3rem;margin-top:.5rem;font-family:var(--mono);font-size:.57rem">
-          <div><div style="color:var(--t3)">HIGH</div><div class="cg">${hi}</div></div>
-          <div><div style="color:var(--t3)">LOW</div><div class="cr">${lo}</div></div>
-        </div>
-        <div style="font-family:var(--mono);font-size:.52rem;color:var(--accent);margin-top:.4rem;opacity:.6">📈 Click to chart</div>
-      </div>`;
-    }).join('');
+    // Pre-render skeleton placeholders immediately
+    cont.innerHTML=syms.map((_,i)=>`<div class="card fx-skel-${cid}-${i}" style="opacity:.4;cursor:pointer">
+      <div class="cl"><span>${syms[i].l}</span></div>
+      <div class="cv cy" style="font-size:1.1rem">—</div>
+      <div class="cs">Loading...</div>
+    </div>`).join('');
+
+    // Fetch each individually and update card as soon as it resolves
+    syms.forEach((item,i)=>{
+      fetchStock(item.s,'').then(d=>{
+        const skel=cont.querySelector('.fx-skel-'+cid+'-'+i);
+        if(!skel||!d)return;
+        const up=d.percent_change>=0;
+        const isActive=fxActiveSym===item.s;
+        const price=fmtFxPrice(d.last_price,item.s);
+        const hi=fmtFxPrice(d.day_high,item.s);
+        const lo=fmtFxPrice(d.day_low,item.s);
+        skel.className=`card${isActive?' card-active':''}`;
+        skel.style.cssText='cursor:pointer;transition:all .2s;opacity:1';
+        skel.onclick=()=>loadFxChart(item.s,item.l,'');
+        skel.innerHTML=`
+          <div class="cl">
+            <span>${item.l}</span>
+            <span class="badge b${updn(d.percent_change)}">${arrow(d.percent_change)} ${pct(abs(d.percent_change))}%</span>
+          </div>
+          <div class="cv" style="font-size:1.25rem;margin:.3rem 0">${price}</div>
+          <div class="cs" style="color:${up?'var(--accent)':'var(--red)'}">Change: ${up?'+':''}${fmtFxPrice(d.change,item.s)}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.3rem;margin-top:.5rem;font-family:var(--mono);font-size:.57rem">
+            <div><div style="color:var(--t3)">HIGH</div><div class="cg">${hi}</div></div>
+            <div><div style="color:var(--t3)">LOW</div><div class="cr">${lo}</div></div>
+          </div>
+          <div style="font-family:var(--mono);font-size:.52rem;color:var(--accent);margin-top:.4rem;opacity:.6">📈 Click to chart</div>`;
+      }).catch(()=>{
+        const skel=cont.querySelector('.fx-skel-'+cid+'-'+i);
+        if(skel)skel.style.opacity='.3';
+      });
+    });
   };
 
-  await Promise.all([
-    fillPar(FX,'fxm'),
-    fillPar(IDX,'fxi'),
-    fillPar(COM,'fxc'),
-  ]);
+  // Render all three sections in parallel without waiting
+  fillProgressive(FX,'fxm');
+  fillProgressive(IDX,'fxi');
+  fillProgressive(COM,'fxc');
 
-  // Auto-load chart for first instrument if none selected
-  if(!fxActiveSym){
-    const first=isOpen()?FX[0]:IDX[0];
-    setTimeout(()=>loadFxChart(first.s,first.l,''),300);
-  }
+  // Auto-load chart — always refresh on page visit
+  const first=isOpen()?FX[0]:IDX[0];
+  const autoSym=fxActiveSym||first.s;
+  const autoName=fxActiveSym?fxActiveName:first.l;
+  setTimeout(()=>loadFxChart(autoSym,autoName,''),200);
 }
 
 // ═══ NEWS ═══
-async function loadNews(q){
+async function loadNews(q, btn){
+  // Highlight active button — works whether called from onclick or programmatically
   document.querySelectorAll('#nc .tfb').forEach(b=>b.classList.remove('on'));
-  if(event?.target) event.target.classList.add('on');
+  if(btn) btn.classList.add('on');
+  else{
+    // Try to find the button by its query text match
+    const allBtns=[...document.querySelectorAll('#nc .tfb')];
+    const matched=allBtns.find(b=>b.getAttribute('onclick')&&b.getAttribute('onclick').includes(q.split(' ')[0]));
+    if(matched)matched.classList.add('on');
+    else if(allBtns[0])allBtns[0].classList.add('on');
+  }
   const feed=document.getElementById('nf');
+  if(!feed)return;
   feed.innerHTML='<div class="sp3" style="margin:3rem auto"></div>';
   try{
     const items=await fetchNews(q);
@@ -1440,12 +1566,14 @@ async function loadNews(q){
         </div>
       </a>`).join('')}</div>`;
     const kw=kwds(items);
-    document.getElementById('tt').innerHTML=kw.map(([w,n])=>`<span class="wt" style="background:rgba(0,212,255,.08);border-color:rgba(0,212,255,.2);color:var(--accent2)">${w}<span style="opacity:.42"> ×${n}</span></span>`).join('');
+    const ttEl=document.getElementById('tt');
+    if(ttEl)ttEl.innerHTML=kw.map(([w,n])=>`<span class="wt" style="background:rgba(0,212,255,.08);border-color:rgba(0,212,255,.2);color:var(--accent2)">${w}<span style="opacity:.42"> ×${n}</span></span>`).join('');
     const bl=items.filter(h=>h.sent.type==='bull').length;
     const br=items.filter(h=>h.sent.type==='bear').length;
     const nn=items.filter(h=>h.sent.type==='neut').length;
     const tot=items.length||1;
-    document.getElementById('ssb').innerHTML=`
+    const ssbEl=document.getElementById('ssb');
+    if(ssbEl)ssbEl.innerHTML=`
       <div style="display:flex;height:13px;border-radius:4px;overflow:hidden;margin-bottom:.5rem">
         <div style="width:${bl/tot*100}%;background:var(--accent);transition:width .9s"></div>
         <div style="width:${nn/tot*100}%;background:var(--yellow)"></div>
@@ -1454,7 +1582,9 @@ async function loadNews(q){
       <div style="display:flex;gap:.9rem;font-family:var(--mono);font-size:.6rem">
         <span><span class="cg">●</span> Bull ${bl}</span><span><span class="cy">●</span> Neutral ${nn}</span><span><span class="cr">●</span> Bear ${br}</span>
       </div>`;
-  }catch(e){feed.innerHTML=`<div class="empty"><div class="et">News unavailable · ${e.message}</div></div>`;}
+  }catch(e){
+    if(feed)feed.innerHTML=`<div class="empty"><div class="et">News unavailable · ${e.message}</div></div>`;
+  }
 }
 
 // ═══ HEATMAP ═══
